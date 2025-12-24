@@ -1,11 +1,33 @@
-import { 
-    eventSource, 
-    saveChat, 
-    reloadCurrentChat, 
-    chat
-} from '../../../script.js';
+// ==========================================
+// AutoRefiner v13.0 - 兼容 third-party 安装
+// ==========================================
 
-import { getContext } from '../../extensions.js';
+// 动态导入，兼容两种安装路径
+let eventSource, saveChat, reloadCurrentChat, chat, getContext;
+
+// 尝试 third-party 路径
+try {
+    const script = await import('../../../../script.js');
+    const ext = await import('../../../extensions.js');
+    eventSource = script.eventSource;
+    saveChat = script.saveChat;
+    reloadCurrentChat = script.reloadCurrentChat;
+    chat = script.chat;
+    getContext = ext.getContext;
+} catch (e) {
+    // 回退到直接安装路径
+    try {
+        const script = await import('../../../script.js');
+        const ext = await import('../../extensions.js');
+        eventSource = script.eventSource;
+        saveChat = script.saveChat;
+        reloadCurrentChat = script.reloadCurrentChat;
+        chat = script.chat;
+        getContext = ext.getContext;
+    } catch (e2) {
+        console.error('[AutoRefiner] Failed to load dependencies:', e2);
+    }
+}
 
 // ==========================================
 // 1. 常量与配置
@@ -13,9 +35,6 @@ import { getContext } from '../../extensions.js';
 const MODULE_NAME = 'AutoRefiner';
 const LOG_PREFIX = `[${MODULE_NAME}]`;
 const SETTING_KEY = 'auto_refiner'; 
-
-// [改进1] 使用更隐蔽的标记，避免被正则误删
-// 零宽字符 + HTML注释，几乎不可能被普通正则匹配
 const REFINE_MARKER = "\u200B<!--AR-->\u200B"; 
 
 const DEFAULT_SETTINGS = {
@@ -30,7 +49,7 @@ const DEFAULT_SETTINGS = {
 // ==========================================
 let globalTxId = 0;        
 let lastStopTimestamp = 0;
-let isCurrentlyProcessing = false; // [改进2] 防止重复触发
+let isCurrentlyProcessing = false;
 
 // ==========================================
 // 3. 日志工具
@@ -97,39 +116,46 @@ function isQuickToggleActive() {
 // ==========================================
 function killTransaction(reason) {
     globalTxId++;
-    isCurrentlyProcessing = false; // 重置处理状态
+    isCurrentlyProcessing = false;
     logger.warn(`Context changed (${reason}). TxId: ${globalTxId}.`);
 }
 
-eventSource.on('chat_id_changed', () => killTransaction('Chat Switched'));
-eventSource.on('character_loaded', () => killTransaction('Character Loaded'));
-eventSource.on('generation_stopped', () => {
-    lastStopTimestamp = Date.now();
-    killTransaction('User Clicked Stop');
-});
-
-// [改进3] 监听生成开始，重置状态防止卡死
-eventSource.on('generation_started', () => {
-    // 如果是用户手动发起的新生成，重置处理锁
-    // 这样即使上一轮出了问题，也不会永远卡住
-    if (isCurrentlyProcessing) {
-        logger.warn('New generation started while processing. Resetting lock.');
-        isCurrentlyProcessing = false;
+function initEventListeners() {
+    if (!eventSource) {
+        logger.error('eventSource not available!');
+        return;
     }
-});
+
+    eventSource.on('chat_id_changed', () => killTransaction('Chat Switched'));
+    eventSource.on('character_loaded', () => killTransaction('Character Loaded'));
+    eventSource.on('generation_stopped', () => {
+        lastStopTimestamp = Date.now();
+        killTransaction('User Clicked Stop');
+    });
+
+    eventSource.on('generation_started', () => {
+        if (isCurrentlyProcessing) {
+            logger.warn('New generation started while processing. Resetting lock.');
+            isCurrentlyProcessing = false;
+        }
+    });
+
+    eventSource.on('generation_ended', handleGenerationEnded);
+    
+    logger.info('Event listeners initialized.');
+}
 
 // ==========================================
 // 7. 核心逻辑
 // ==========================================
-eventSource.on('generation_ended', async () => {
+async function handleGenerationEnded() {
     const settings = getSettings();
     
     if (!settings.enabled) return;
     if (!isQuickToggleActive()) return;
     
-    // [改进4] 防止重复触发
     if (isCurrentlyProcessing) {
-        logger.info('Already processing. Skipping duplicate trigger.');
+        logger.info('Already processing. Skipping.');
         return;
     }
     
@@ -154,10 +180,9 @@ eventSource.on('generation_ended', async () => {
 
         if (lastMsg.is_user) return;
 
-        // [改进5] 检测标记时使用 includes，兼容标记被部分处理的情况
         const hasMarker = prevMsg.is_user && prevMsg.mes.includes('<!--AR-->');
 
-        // === [Phase 1] 初稿 ===
+        // === Phase 1: 初稿 ===
         if (!hasMarker) {
             if (!prevMsg.is_user) return;
 
@@ -167,7 +192,6 @@ eventSource.on('generation_ended', async () => {
                 return;
             }
 
-            // 设置处理锁
             isCurrentlyProcessing = true;
             logger.step(`Initiating Refinement...`);
 
@@ -184,7 +208,7 @@ eventSource.on('generation_ended', async () => {
             clickSendButtonSafe(currentTaskTxId);
         }
         
-        // === [Phase 2] 合并 ===
+        // === Phase 2: 合并 ===
         else {
             if (liveChat.length < 3) {
                 isCurrentlyProcessing = false;
@@ -195,11 +219,10 @@ eventSource.on('generation_ended', async () => {
             const instructionMsg = liveChat[liveChat.length - 2];
             const refinedDraft = liveChat[liveChat.length - 1];
 
-            // [改进6] 增强的完整性检查
             if (liveChat[liveChat.length - 1] !== refinedDraft || 
                 liveChat[liveChat.length - 2] !== instructionMsg ||
                 liveChat[liveChat.length - 3] !== originalDraft) {
-                logger.error('Integrity Check Failed. Another plugin may have modified chat.');
+                logger.error('Integrity Check Failed.');
                 isCurrentlyProcessing = false;
                 return;
             }
@@ -214,10 +237,9 @@ eventSource.on('generation_ended', async () => {
             try {
                 logger.step('Merging...');
                 
-                // [改进7] 合并前再次确认数据
                 const finalCheck = getContext().chat;
                 if (finalCheck[finalCheck.length - 1] !== refinedDraft) {
-                    throw new Error('Chat modified during merge preparation');
+                    throw new Error('Chat modified during merge');
                 }
                 
                 originalDraft.mes = refinedDraft.mes;
@@ -230,13 +252,13 @@ eventSource.on('generation_ended', async () => {
                 toastr.success('✨ 已精修合并', MODULE_NAME);
             } catch (e) {
                 logger.error('Merge failed: ' + e.message);
-                toastr.error('合并失败: ' + e.message, MODULE_NAME);
+                toastr.error('合并失败', MODULE_NAME);
             } finally {
                 isCurrentlyProcessing = false;
             }
         }
     }, 800);
-});
+}
 
 // ==========================================
 // 8. 点击器
@@ -296,6 +318,9 @@ function injectStyles() {
 // 10. 初始化
 // ==========================================
 jQuery(async () => {
+    // 初始化事件监听
+    initEventListeners();
+    
     injectStyles();
     
     if ($('#auto_refiner_quick_btn').length === 0) {
@@ -327,31 +352,29 @@ jQuery(async () => {
                     <div class="flex-container">
                         <label class="checkbox_label">
                             <input type="checkbox" id="auto_refiner_enable" />
-                            启用插件 (Master Switch)
+                            启用插件
                         </label>
                     </div>
                     
                     <div class="flex-container">
                         <label class="checkbox_label">
                             <input type="checkbox" id="auto_refiner_show_quick" />
-                            显示临时开关 (Show Quick Toggle)
+                            显示临时开关
                         </label>
                     </div>
 
                     <div class="flex-container" style="margin-top:5px; align-items:center;">
-                        <span style="flex:1;">最低字数 (Min Length):</span>
+                        <span style="flex:1;">最低字数:</span>
                         <input type="number" id="auto_refiner_min_length" style="width:60px;" min="0" />
                     </div>
                     
                     <div style="margin-top:5px;">
-                        <label>精修提示词 (Prompt):</label>
+                        <label>精修提示词:</label>
                         <textarea id="auto_refiner_prompt" rows="3" class="text_pole" style="width:100%"></textarea>
                     </div>
                     
                     <hr style="margin:10px 0; opacity:0.3;">
-                    <small style="opacity:0.6;">
-                        v12.5 | 标记: &lt;!--AR--&gt; | 如正则冲突请保留此标记
-                    </small>
+                    <small style="opacity:0.6;">v13.0</small>
                 </div>
             </div>
         </div>
@@ -363,7 +386,6 @@ jQuery(async () => {
             settings.enabled = $(this).is(':checked');
             savePluginSettings();
             updateQuickButtonVisibility();
-            logger.info(`Enabled: ${settings.enabled}`);
         });
 
         $('#auto_refiner_show_quick').prop('checked', settings.showQuickToggle).on('change', function() {
@@ -385,5 +407,5 @@ jQuery(async () => {
 
     updateQuickButtonVisibility();
     
-    console.log(`${LOG_PREFIX} v12.5 Loaded. Compatibility mode enabled.`);
+    console.log(`${LOG_PREFIX} v13.0 Loaded.`);
 });
